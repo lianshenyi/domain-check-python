@@ -42,6 +42,30 @@ class DotenvTests(unittest.TestCase):
         self.assertEqual(call.args[:2], ("export-token", "export-chat"))
 
 
+
+class ProgressTests(unittest.TestCase):
+    def test_fast_result_is_reported_before_slow_target_finishes(self):
+        from threading import Event
+        reported = Event()
+
+        def check(url, *args):
+            if url == "slow" and not reported.wait(2):
+                raise AssertionError("fast target was hidden behind slow target")
+            return True, "HTTP 200"
+
+        def log(message, *args):
+            if "fast" in args:
+                reported.set()
+
+        with patch.object(dc, "load_dotenv"):
+            with patch.object(dc, "load_targets", return_value=["slow", "fast"]):
+                with patch.object(dc, "check_url", side_effect=check):
+                    with patch.object(dc.LOG, "info", side_effect=log):
+                        result = dc.main(["--once", "--dry-run", "--workers", "2"])
+        self.assertEqual(result, 0)
+        self.assertTrue(reported.is_set())
+
+
 class ConfigTests(unittest.TestCase):
     def load(self, text):
         with patch.object(Path, "read_text", return_value=text):
@@ -96,24 +120,6 @@ class ProbeTests(unittest.TestCase):
 
 
 class NotificationTests(unittest.TestCase):
-    def test_outage_dedup_recovery_and_next_outage(self):
-        alerted = set()
-        notify = MagicMock(return_value=True)
-        for healthy in (True, False, False, True, True, False):
-            dc.notify_result("https://example.com", healthy, "detail", alerted, notify)
-        self.assertEqual(notify.call_count, 3)
-        self.assertIn("异常", notify.call_args_list[0].args[0])
-        self.assertIn("恢复", notify.call_args_list[1].args[0])
-
-    def test_failed_delivery_retried_for_outage_and_recovery(self):
-        alerted = set()
-        notify = MagicMock(side_effect=[False, True, False, True])
-        for healthy, expected in ((False, set()), (False, {"url"}),
-                                  (True, {"url"}), (True, set())):
-            dc.notify_result("url", healthy, "detail", alerted, notify)
-            self.assertEqual(alerted, expected)
-        self.assertEqual(notify.call_count, 4)
-
     @patch("domain_check.urlopen")
     def test_telegram_post(self, open_url):
         response = MagicMock()

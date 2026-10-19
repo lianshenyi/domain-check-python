@@ -30,6 +30,7 @@ python3 -u domain_check.py
 ```dotenv
 TG_BOT_TOKEN=你的机器人token
 TG_CHAT_ID=你的用户或群chat_id
+ALERT_COOLDOWN_HOURS=3
 ```
 
 无需 export；支持引号和注释。已有环境变量优先；.env 不存在时继续使用环境变量。修改后重启生效。.env 已加入 .gitignore。不要将 token 写进 config 或提交到 Git。
@@ -42,9 +43,9 @@ Telegram 通过官方 [sendMessage API](https://core.telegram.org/bots/api#sendm
 - 检查网站健康状态只接受 200–399：加 `--max-status 399`；只接受 200：加 `--max-status 200`。
 - 每个 URL 失败最多尝试 3 次，尝试间隔 1 秒，请求超时默认 10 秒；采用 GET，只获取响应头，不读取正文。
 - 默认 8 个并发目标；每轮全部检查、通知完成后等待 60 秒，开始下一轮。
-- 一个目标一轮内尝试全部失败后发异常通知；持续故障不重复发送，恢复时发一次恢复通知。
+- 每轮完成后汇总异常与恢复，包含总计、可用和异常数；同一 URL 的异常通知默认冷却 3 小时，恢复立即通知。
 - TG 发送失败会记录日志，并在下一轮当前状态仍需通知时重试。未成功送达的短暂故障若已恢复，不补发过期异常。
-- 去重状态保存在内存，重启后仍异常的目标会重新通知。网络超时但 TG 已实际收到时，重试可能产生重复消息。
+- 通知状态保存在磁盘，重启后继续遵守冷却；网络超时但 TG 已实际收到时，重试可能产生重复消息。
 - 检测反映运行机器的访问结果；遵循系统代理环境变量。DNS 解析耗时受操作系统影响，timeout 不是整轮总时限。
 
 ```sh
@@ -104,4 +105,50 @@ sudo systemctl restart domain-check.service
 sudo systemctl disable --now domain-check.service
 ```
 
-服务文件已提供；当前开发环境是 macOS，实际服务启用及重启行为需在 Linux 服务器验证。
+服务文件包含 StateDirectory=domain-check，用于为服务账号提供可写的通知记录目录。更新服务文件后需 daemon-reload 并重启。
+
+## 检测耗时与进度
+
+结果按完成顺序实时打印，并显示 `[已完成/总数]`、失败重试和整轮耗时。慢目标不会阻止已经完成的目标输出。
+
+默认失败目标最多尝试 3 次，每次请求超时 10 秒，重试间隔 1 秒；TLS、多个解析地址、重定向和 DNS 可能使总耗时进一步增加，10 秒不是单个目标的总时限。`--dry-run` 只关闭 TG 发送，不减少检测或重试。
+
+需要快速排查时：
+
+```sh
+python3 domain_check.py --once --dry-run --attempts 1 --timeout 3 --workers 24
+```
+
+快速模式可能将偶发的网络延迟判为失败；常驻监控建议保留重试。
+
+## 汇总通知与冷却时间
+
+.env 中设置：
+
+```dotenv
+ALERT_COOLDOWN_HOURS=3
+```
+
+单位为小时，默认 3，支持 0.5 等小数，必须大于 0。修改后重启服务生效。
+
+每轮完成后最多发送一条汇总，包含“总计 / 可用 / 异常”数量，以及本次需要提醒的异常和恢复列表。控制台仍按完成顺序实时打印检测结果。汇总中的异常总数包含仍处于冷却期的目标；列表仅包含本次符合通知条件的目标。
+
+- 冷却按 URL 独立计算，以异常消息成功发送为准。3 小时内不重复报该 URL 的异常；持续异常满 3 小时后再次汇总提醒。新的异常 URL 不受其他 URL 冷却限制。
+- 已成功告警的目标恢复后立即通知，不受冷却限制。恢复后若再次异常，仍沿用上次异常告警的冷却时间；冷却内未重新告警的短暂故障不会再单独发恢复通知。
+- TG 发送失败不更新通知记录，下轮按最新状态重试。全部正常且没有待通知的恢复时保持静默。
+- 通知记录原子写入磁盘，重启后保留冷却与待恢复状态。systemd 使用 StateDirectory 提供的 `/var/lib/domain-check/alerts.json`；手动运行默认使用项目 `.state/alerts.json`，两者记录独立。可通过 STATE_DIRECTORY 指定手动运行的状态目录。
+- dry-run 会读取记录并模拟汇总，但不发送 TG、不写入通知记录。首次升级无法继承旧进程的内存记录，生效后可能先收到一条当前异常汇总。
+- 汇总过长时优先缩短错误原因以保留所有 URL；仍无法容纳一条消息时记录错误且不更新冷却。请求超时但 TG 实际已收到、或送达后进程立即崩溃时，仍可能重复通知。
+
+生效命令（git-jks 上的项目路径）：
+
+```sh
+cd /git/domain-check-python
+# 编辑 .env，将 ALERT_COOLDOWN_HOURS 设为需要的小时数；不填默认 3
+sed 's|/opt/domain-check|/git/domain-check-python|g' domain-check.service > /etc/systemd/system/domain-check.service
+systemctl daemon-reload
+systemctl restart domain-check
+journalctl -u domain-check -f
+```
+
+首次安装用户请按上文完成服务账号和虚拟环境准备后再启用服务。

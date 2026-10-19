@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check URLs from a text file and notify Telegram on outage/recovery."""
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
 import logging
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import socket
 import time
+import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -64,6 +66,8 @@ def check_url(url, timeout, attempts, retry_delay, max_status):
         except (URLError, OSError, ValueError) as exc:
             detail = str(exc)
         if attempt + 1 < attempts:
+            LOG.warning("%s 第 %d/%d 次失败：%s；%.1f 秒后重试",
+                        url, attempt + 1, attempts, detail, retry_delay)
             time.sleep(retry_delay)
     return False, detail
 
@@ -71,7 +75,7 @@ def check_url(url, timeout, attempts, retry_delay, max_status):
 def send_telegram(token, chat_id, message, timeout):
     request = Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        data=urlencode({"chat_id": chat_id, "text": message[:4000]}).encode(),
+        data=urlencode({"chat_id": chat_id, "text": message}).encode(),
         method="POST",
     )
     try:
@@ -83,25 +87,107 @@ def send_telegram(token, chat_id, message, timeout):
         return False
 
 
-def notify_result(url, healthy, detail, alerted, notify):
-    """Only commit notification state after successful delivery."""
-    if healthy and url not in alerted:
-        return
-    if not healthy and url in alerted:
-        return
-    title = "✅ 域名恢复" if healthy else "🚨 域名异常"
-    message = (
-        f"{title}\n{url}\n{detail[:500]}\n"
-        f"检测节点：{socket.gethostname()}\n"
-        f"时间：{datetime.now().astimezone().isoformat(timespec='seconds')}"
-    )
-    if not notify(message):
-        LOG.error("Telegram 通知失败，下轮重试：%s", url)
-        return
-    if healthy:
-        alerted.remove(url)
+@dataclass(frozen=True)
+class AlertState:
+    last_alert: float
+    unrecovered: bool
+
+
+def cooldown_seconds():
+    try:
+        seconds = float(os.environ.get("ALERT_COOLDOWN_HOURS", "3")) * 3600
+    except ValueError as exc:
+        raise ValueError("ALERT_COOLDOWN_HOURS 必须是大于 0 的有限小时数") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("ALERT_COOLDOWN_HOURS 必须是大于 0 的有限小时数")
+    return seconds
+
+
+def load_alert_state(path):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("通知记录格式错误")
+    states = {}
+    for url, record in payload.items():
+        if not isinstance(record, dict):
+            raise ValueError("通知记录格式错误")
+        stamp = record.get("last_alert")
+        if type(stamp) not in (int, float):
+            raise ValueError("通知时间格式错误")
+        try:
+            stamp = float(stamp)
+        except OverflowError as exc:
+            raise ValueError("通知时间超出范围") from exc
+        if not math.isfinite(stamp) or stamp < 0 or type(record.get("unrecovered")) is not bool:
+            raise ValueError("通知记录格式错误")
+        states[url] = AlertState(stamp, record["unrecovered"])
+    return states
+
+
+def save_alert_state(path, states):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=path.name + ".", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump({url: asdict(state) for url, state in states.items()}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def notify_round(results, states, notify, *, now, cooldown):
+    outages = []
+    recoveries = []
+    for url, (healthy, detail) in sorted(results.items()):
+        prior = states.get(url)
+        if healthy:
+            if prior is not None and prior.unrecovered:
+                recoveries.append((url, detail))
+        elif prior is None or now - prior.last_alert >= cooldown:
+            outages.append((url, detail))
+    if not outages and not recoveries:
+        return False
+
+    available = sum(healthy for healthy, _ in results.values())
+    header = (f"📊 域名检测汇总\n总计 {len(results)} / 可用 {available}"
+              f" / 异常 {len(results) - available}")
+    footer = (f"\n检测节点：{socket.gethostname()}\n"
+              f"时间：{datetime.now().astimezone().isoformat(timespec='seconds')}")
+    # Preserve all target URLs; shorten reasons before dropping notification.
+    for limit in (160, 80, 0):
+        sections = [header]
+        for title, entries in (("🚨 异常提醒", outages), ("✅ 恢复通知", recoveries)):
+            if entries:
+                lines = [f"{title}（{len(entries)}）"]
+                for url, detail in entries:
+                    lines.append(url)
+                    if limit:
+                        lines.append(detail.replace("\n", " ")[:limit])
+                sections.append("\n".join(lines))
+        message = "\n\n".join(sections) + footer
+        if len(message) <= 4000:
+            break
     else:
-        alerted.add(url)
+        LOG.error("汇总消息超过 Telegram 长度限制，未发送；请减少单个实例的目标数")
+        return False
+
+    if not notify(message):
+        LOG.error("Telegram 汇总发送失败，下轮重试")
+        return False
+    for url, _ in outages:
+        states[url] = AlertState(now, True)
+    for url, _ in recoveries:
+        states[url] = AlertState(states[url].last_alert, False)
+    return True
 
 
 def positive_float(value):
@@ -156,23 +242,45 @@ def main(argv=None):
         return 0 if notify("✅ domain-check 测试通知") else 2
     try:
         targets = load_targets(args.config)
+        cooldown = cooldown_seconds()
+        state_path = Path(os.environ.get(
+            "STATE_DIRECTORY", str(Path(__file__).resolve().parent / ".state"))) / "alerts.json"
+        states = load_alert_state(state_path)
+        if not args.dry_run:
+            save_alert_state(state_path, states)
     except (OSError, ValueError) as exc:
         LOG.error("读取配置失败：%s", exc)
         return 2
     LOG.info("加载 %d 个目标；HTTP 200–%d 算可达", len(targets), args.max_status)
-    alerted = set()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         while True:
-            results = list(pool.map(
-                lambda url: check_url(url, args.timeout, args.attempts,
-                                      args.retry_delay, args.max_status),
-                targets,
-            ))
-            for url, (healthy, detail) in zip(targets, results):
-                LOG.info("%s %s %s", "OK" if healthy else "FAIL", url, detail)
-                notify_result(url, healthy, detail, alerted, notify)
+            started = time.monotonic()
+            futures = {
+                pool.submit(check_url, url, args.timeout, args.attempts,
+                            args.retry_delay, args.max_status): url
+                for url in targets
+            }
+            failed = 0
+            results = {}
+            for completed, future in enumerate(as_completed(futures), 1):
+                url = futures[future]
+                healthy, detail = future.result()
+                failed += not healthy
+                LOG.info("[%d/%d] %s %s %s（本轮已用 %.1f 秒）",
+                         completed, len(targets), "OK" if healthy else "FAIL",
+                         url, detail, time.monotonic() - started)
+                results[url] = (healthy, detail)
+            LOG.info("本轮完成：%d 个目标，%d 个失败，耗时 %.1f 秒",
+                     len(targets), failed, time.monotonic() - started)
+            changed = notify_round(results, states, notify, now=time.time(), cooldown=cooldown)
+            if changed and not args.dry_run:
+                try:
+                    save_alert_state(state_path, states)
+                except OSError as exc:
+                    LOG.error("保存通知记录失败：%s", exc)
+                    return 2
             if args.once:
-                return 1 if any(not healthy for healthy, _ in results) else 0
+                return 1 if failed else 0
             time.sleep(args.interval)
 
 

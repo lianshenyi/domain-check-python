@@ -12,6 +12,8 @@ WorkingDirectory=/opt/domain-check
 ExecStart=/opt/domain-check/.venv/bin/python -u /opt/domain-check/domain_check.py
 Restart=on-failure
 RestartSec=10
+StateDirectory=domain-check
+StateDirectoryMode=0700
 Environment=PYTHONDONTWRITEBYTECODE=1
 NoNewPrivileges=true
 StandardOutput=journal
