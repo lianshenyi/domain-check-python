@@ -1,0 +1,21 @@
+[Unit]
+Description=Domain connectivity monitor with Telegram alerts
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=domain-check
+Group=domain-check
+WorkingDirectory=/opt/domain-check
+ExecStart=/opt/domain-check/.venv/bin/python -u /opt/domain-check/domain_check.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
