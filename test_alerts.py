@@ -126,5 +126,133 @@ class AlertTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "alerts.json").exists())
 
 
+class RecoveryStreakTests(unittest.TestCase):
+    def test_recovery_requires_consecutive_successes(self):
+        state = {"a": dc.AlertState(10000, True)}
+        send = MagicMock(return_value=True)
+        for now in (10001, 10002):
+            changed = dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                                      now=now, cooldown=10800, recovery_rounds=3)
+            self.assertTrue(changed)
+            send.assert_not_called()
+            self.assertTrue(state["a"].unrecovered)
+        self.assertEqual(state["a"].streak, 2)
+
+        dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                        now=10003, cooldown=10800, recovery_rounds=3)
+        send.assert_called_once()
+        self.assertIn("恢复", send.call_args.args[0])
+        self.assertFalse(state["a"].unrecovered)
+        self.assertEqual(state["a"].streak, 0)
+
+        # 达标并发过一次恢复通知后，后续成功不再重复发送。
+        dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                        now=10004, cooldown=10800, recovery_rounds=3)
+        self.assertEqual(send.call_count, 1)
+
+    def test_failure_resets_streak(self):
+        state = {"a": dc.AlertState(10000, True)}
+        send = MagicMock(return_value=True)
+        for now in (10001, 10002):
+            dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                            now=now, cooldown=10800, recovery_rounds=3)
+        self.assertEqual(state["a"].streak, 2)
+
+        # 冷却期内失败不重复发异常，但必须清零 streak。
+        dc.notify_round({"a": (False, "TLS error")}, state, send,
+                        now=10003, cooldown=10800, recovery_rounds=3)
+        send.assert_not_called()
+        self.assertTrue(state["a"].unrecovered)
+        self.assertEqual(state["a"].streak, 0)
+
+        for now in (10004, 10005):
+            dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                            now=now, cooldown=10800, recovery_rounds=3)
+        send.assert_not_called()
+        self.assertEqual(state["a"].streak, 2)
+        dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                        now=10006, cooldown=10800, recovery_rounds=3)
+        send.assert_called_once()
+        self.assertFalse(state["a"].unrecovered)
+
+    def test_streak_survives_save_and_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "alerts.json"
+            dc.save_alert_state(path, {"a": dc.AlertState(10000, True, 2)})
+            state = dc.load_alert_state(path)
+            self.assertEqual(state["a"].streak, 2)
+            send = MagicMock(return_value=True)
+            dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                            now=10001, cooldown=10800, recovery_rounds=3)
+            send.assert_called_once()
+            self.assertFalse(state["a"].unrecovered)
+
+    def test_old_state_without_streak_is_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "alerts.json"
+            path.write_text('{"a":{"last_alert":10000,"unrecovered":true}}',
+                            encoding="utf-8")
+            state = dc.load_alert_state(path)
+            self.assertEqual(state["a"], dc.AlertState(10000, True, 0))
+            send = MagicMock(return_value=True)
+            dc.notify_round({"a": (True, "HTTP 200")}, state, send,
+                            now=10001, cooldown=10800, recovery_rounds=3)
+            send.assert_not_called()
+            self.assertTrue(state["a"].unrecovered)
+            self.assertEqual(state["a"].streak, 1)
+
+    def test_invalid_streak_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "alerts.json"
+            for value in ("true", "-1", '"2"', "1.5", "null"):
+                path.write_text(
+                    '{"a":{"last_alert":10000,"unrecovered":true,"streak":%s}}' % value,
+                    encoding="utf-8")
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    dc.load_alert_state(path)
+
+    def test_main_persists_streak_across_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "alerts.json"
+            dc.save_alert_state(path, {"https://a.example": dc.AlertState(10000, True, 0)})
+            environment = {"STATE_DIRECTORY": directory, "TG_BOT_TOKEN": "token",
+                           "TG_CHAT_ID": "1"}
+            send = MagicMock(return_value=True)
+            with patch.dict(os.environ, environment, clear=True):
+                with patch.object(dc, "load_dotenv"):
+                    with patch.object(dc, "load_targets",
+                                      return_value=["https://a.example"]):
+                        with patch.object(dc, "check_target",
+                                          return_value=(True, "HTTP 200")):
+                            with patch.object(dc, "send_telegram", send):
+                                for expected in (1, 2):
+                                    self.assertEqual(dc.main([
+                                        "--once", "--recovery-confirm-rounds", "3"]), 0)
+                                    send.assert_not_called()
+                                    saved = dc.load_alert_state(path)["https://a.example"]
+                                    self.assertEqual(saved.streak, expected)
+                                    self.assertTrue(saved.unrecovered)
+                                self.assertEqual(dc.main([
+                                    "--once", "--recovery-confirm-rounds", "3"]), 0)
+            send.assert_called_once()
+            saved = dc.load_alert_state(path)["https://a.example"]
+            self.assertFalse(saved.unrecovered)
+            self.assertEqual(saved.streak, 0)
+
+    def test_unconfirmed_recovery_still_counts_as_available(self):
+        state = {"a": dc.AlertState(10000, True)}
+        send = MagicMock(return_value=True)
+        results = {"a": (True, "HTTP 200"), "b": (False, "TLS error")}
+        dc.notify_round(results, state, send, now=10001, cooldown=10800,
+                        recovery_rounds=3)
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        self.assertIn("总计 2 / 可用 1 / 异常 1", message)
+        self.assertNotIn("恢复通知", message)
+        self.assertIn("b", message)
+        self.assertTrue(state["a"].unrecovered)
+        self.assertEqual(state["a"].streak, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
