@@ -19,7 +19,38 @@ class AlertTests(unittest.TestCase):
         message = send.call_args.args[0]
         for text in ("总计 3", "可用 1", "异常 2", "bad-a", "bad-b"):
             self.assertIn(text, message)
+        self.assertIn("🚨 异常清单（2）", message)
+        self.assertIn("本轮新告警 2 个", message)
         self.assertEqual(set(state), {"bad-a", "bad-b"})
+
+    def test_abnormal_list_includes_all_failures_with_markers(self):
+        now = 20000
+        results = {f"https://bad{i}.example": (False, f"error {i}") for i in range(5)}
+        # 前 4 个仍在冷却期，只有最后一个需要本轮告警。
+        state = {url: dc.AlertState(now - 100, True) for url in list(results)[:4]}
+        send = MagicMock(return_value=True)
+        dc.notify_round(results, state, send, now=now, cooldown=10800)
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        self.assertIn("🚨 异常清单（5）", message)
+        self.assertIn("本轮新告警 1 个", message)
+        self.assertEqual(message.count("🆕 "), 1)
+        self.assertEqual(message.count("⏳ "), 4)
+        lines = message.splitlines()
+        for url in results:
+            self.assertIn(url, message)
+            line = next(line for line in lines if url in line)
+            marker = "🆕" if url == "https://bad4.example" else "⏳"
+            self.assertTrue(line.startswith(f"{marker} {url} — "), line)
+
+    def test_all_failures_in_cooldown_stays_silent(self):
+        state = {f"https://bad{i}.example": dc.AlertState(10000, True)
+                 for i in range(5)}
+        results = {url: (False, "DNS") for url in state}
+        send = MagicMock(return_value=True)
+        changed = dc.notify_round(results, state, send, now=10001, cooldown=10800)
+        self.assertFalse(changed)
+        send.assert_not_called()
 
     def test_cooldown_boundary_and_independent_targets(self):
         state = {}
@@ -30,7 +61,9 @@ class AlertTests(unittest.TestCase):
         dc.notify_round({"a": (False, "DNS"), "b": (False, "TLS")},
                         state, send, now=20799, cooldown=10800)
         self.assertEqual(send.call_count, 2)
-        self.assertNotIn("\na\n", send.call_args.args[0])
+        message = send.call_args.args[0]
+        self.assertIn("⏳ a — DNS", message)
+        self.assertIn("🆕 b — TLS", message)
         dc.notify_round({"a": (False, "DNS")}, state, send, now=20800, cooldown=10800)
         self.assertEqual(send.call_count, 3)
 
@@ -111,6 +144,27 @@ class AlertTests(unittest.TestCase):
         send.assert_called_once()
         message = send.call_args.args[0]
         self.assertLessEqual(len(message), 4000)
+        self.assertIn("🚨 异常清单（24）", message)
+        self.assertEqual(message.count("🆕 "), 24)
+        for url in results:
+            self.assertIn(f"🆕 {url} — ", message)
+
+    def test_length_limit_preserves_urls_with_mixed_markers(self):
+        now = 50000
+        results = {f"https://long{i}.example/check": (False, "x" * 1000)
+                   for i in range(24)}
+        results["https://new.example/check"] = (False, "y" * 1000)
+        # 前 12 个处于冷却期，其余 13 个本轮需要告警。
+        state = {url: dc.AlertState(now - 100, True) for url in list(results)[:12]}
+        send = MagicMock(return_value=True)
+        dc.notify_round(results, state, send, now=now, cooldown=10800)
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        self.assertLessEqual(len(message), 4000)
+        self.assertIn("🚨 异常清单（25）", message)
+        self.assertIn("本轮新告警 13 个", message)
+        self.assertEqual(message.count("🆕 "), 13)
+        self.assertEqual(message.count("⏳ "), 12)
         for url in results:
             self.assertIn(url, message)
 

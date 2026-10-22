@@ -297,17 +297,33 @@ def notify_round(results, states, notify, *, now, cooldown, recovery_rounds=1):
               f" / 异常 {len(results) - available}")
     footer = (f"\n检测节点：{socket.gethostname()}\n"
               f"时间：{datetime.now().astimezone().isoformat(timespec='seconds')}")
+    # 异常清单始终列出本轮全部失败目标：🆕 为本轮需要通知的（新告警或冷却
+    # 期满），⏳ 为仍在冷却期的已知异常。恢复通知保持原有格式。
+    outage_urls = {url for url, _ in outages}
+    failures = [(url, detail) for url, (healthy, detail) in sorted(results.items())
+                if not healthy]
     # Preserve all target URLs; shorten reasons before dropping notification.
     for limit in (160, 80, 0):
         sections = [header]
-        for title, entries in (("🚨 异常提醒", outages), ("✅ 恢复通知", recoveries)):
-            if entries:
-                lines = [f"{title}（{len(entries)}）"]
-                for url, detail in entries:
-                    lines.append(url)
-                    if limit:
-                        lines.append(detail.replace("\n", " ")[:limit])
-                sections.append("\n".join(lines))
+        if failures:
+            lines = [f"🚨 异常清单（{len(failures)}）"]
+            for url, detail in failures:
+                marker = "🆕" if url in outage_urls else "⏳"
+                if limit:
+                    reason = detail.replace("\n", " ")[:limit]
+                    lines.append(f"{marker} {url} — {reason}")
+                else:
+                    lines.append(f"{marker} {url}")
+            if outages:
+                lines.append(f"本轮新告警 {len(outages)} 个")
+            sections.append("\n".join(lines))
+        if recoveries:
+            lines = [f"✅ 恢复通知（{len(recoveries)}）"]
+            for url, detail in recoveries:
+                lines.append(url)
+                if limit:
+                    lines.append(detail.replace("\n", " ")[:limit])
+            sections.append("\n".join(lines))
         message = "\n\n".join(sections) + footer
         if len(message) <= 4000:
             break
